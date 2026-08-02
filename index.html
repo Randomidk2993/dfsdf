@@ -2699,9 +2699,13 @@ nav {
             <span class="srv-dot"></span> Server 2
           </button>
           <div class="server-divider" style="margin-top:10px"></div>
-          <button class="server-btn" id="srv-anistream" onclick="switchServer('anistream')" style="margin-top:10px">
+          <button class="server-btn" id="srv-vidnest" onclick="switchServer('vidnest')" style="margin-top:10px">
             <span class="srv-badge best">Best</span>
             <span class="srv-dot"></span> Server 3
+          </button>
+          <div class="server-divider" style="margin-top:10px"></div>
+          <button class="server-btn" id="srv-vidnest-pahe" onclick="switchServer('vidnest-pahe')" style="margin-top:10px">
+            <span class="srv-dot"></span> Server 4
           </button>
         </div>
         <div class="anistream-status" id="anistreamStatus">
@@ -3541,16 +3545,28 @@ const PROVIDERS = [
     id: "animplay",
     name: "Server 2",
     supportsAudio: true,
-    // Server 2 also uses AniList ID
+    // Server 2 uses AniList ID
     getUrl: (anilistId, season, episode, audio = "sub") => {
-      return `https://animeplay.cfd/stream/ani/${anilistId}/${episode}/${audio}`;
+      return `https://megaplay.buzz/stream/ani/${anilistId}/${episode}/${audio}`;
     }
   },
   {
-    id: "anistream",
+    id: "vidnest",
     name: "Server 3",
-    supportsAudio: false,
-    getUrl: () => null
+    supportsAudio: true,
+    // Server 3 uses AniList ID via VidNest API
+    getUrl: (anilistId, season, episode, audio = "sub") => {
+      return `https://vidnest.fun/anime/${anilistId}/${episode}/${audio}`;
+    }
+  },
+  {
+    id: "vidnest-pahe",
+    name: "Server 4",
+    supportsAudio: true,
+    // Server 4 uses AniList ID via VidNest AnimePahe API
+    getUrl: (anilistId, season, episode, audio = "sub") => {
+      return `https://vidnest.fun/animepahe/${anilistId}/${episode}/${audio}`;
+    }
   }
 ];
 
@@ -3646,211 +3662,98 @@ function dismissDailyBanner() {
 // ─────────────────────────────────────────────────────────────────
 // ANISTREAM CONFIG
 // ─────────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────
-// SERVER 3 — combined-three-phi.vercel.app
-// Uses our own AnimePaheAPI backend.
-// Flow: search (JSON API) → episodes (HTML scrape) → /embed (full player)
-// The /embed endpoint handles sources, m3u8, proxy internally.
-// ─────────────────────────────────────────────────────────────────
 const ANISTREAM_DEFAULT = 'https://combined-three-phi.vercel.app';
 
 function getAnistreamBase() {
   return localStorage.getItem('anistream_worker') || ANISTREAM_DEFAULT;
 }
 
-// Per-page-load in-memory cache (cleared on refresh, prevents redundant API calls)
 const anistreamCache = {};
-let anistreamAnimeSession = null;  // anime slug, e.g. "demon-slayer-kimetsu-no-yaiba"
-let anistreamEpSessions = {};      // { epNumber: episodeSlug }
+let anistreamAnimeSession = null;
+let anistreamEpSessions = {};
 let anistreamEpData = [];
 
-// Fetch from our combined API
 async function anistreamFetch(path) {
   const url = getAnistreamBase() + path;
-  const r = await fetch(url, { cache: 'no-store' });
-  if (!r.ok) throw new Error(`Server 3 HTTP ${r.status} for ${path}`);
+  const r = await fetch(url, { headers: { 'ngrok-skip-browser-warning': '1' } });
+  if (!r.ok) throw new Error(`AniStream HTTP ${r.status}`);
   return r.json();
 }
 
-// Search for an anime on our API and return the best-matching slug.
-// Makes ONE search call with the english title (which works as shown by testing),
-// then picks the best result by word overlap scoring.
 async function anistreamFindSession(anime) {
-  const eng           = (anime.title.english       || '').trim();
-  const romaji        = (anime.title.romaji        || '').trim();
-  const userPreferred = (anime.title.userPreferred || '').trim();
+  const titles = [
+    anime.title.english,
+    anime.title.romaji,
+    anime.title.english && anime.title.english.replace(/\s*[\(:].*/,'').trim(),
+    anime.title.romaji && anime.title.romaji.replace(/\s*[\(:].*/,'').trim(),
+  ].filter((t, i, arr) => t && arr.indexOf(t) === i);
 
-  // Strip subtitle after colon/dash - handles all colon variants
-  function clean(t) {
-    return t.replace(/\s*[:\uFF1A\u2013\u2014\u2212].*/,'').trim();
-  }
-
-  const engClean    = clean(eng);
-  const romajiClean = clean(romaji);
-  const prefClean   = clean(userPreferred);
-
-  // Score how well a result title matches the anime
-  const engLower    = engClean.toLowerCase();
-  const romajiLower = romajiClean.toLowerCase();
-  const prefLower   = prefClean.toLowerCase();
-  const engWords    = engLower.split(/\s+/).filter(w => w.length > 2);
-  const romajiWords = romajiLower.split(/\s+/).filter(w => w.length > 2);
-  const prefWords   = prefLower.split(/\s+/).filter(w => w.length > 2);
-
-  // Letter-length similarity: higher score when lengths are close.
-  // Returns 0–20 bonus. Penalises results that are wildly longer/shorter.
-  function lengthSim(query, candidate) {
-    const qLen = query.length;
-    const cLen = candidate.length;
-    if (!qLen || !cLen) return 0;
-    const diff = Math.abs(qLen - cLen);
-    // Perfect length match = 20, each extra char costs 1 point, floor at 0
-    return Math.max(0, 20 - diff);
-  }
-
-  function score(title) {
-    const t = title.toLowerCase();
-
-    // Exact match wins outright
-    if (t === engLower || t === romajiLower || t === prefLower) return 9999;
-
-    let s = 0;
-
-    // Prefix match (title starts with query or vice-versa) — very strong signal
-    if (t.startsWith(engLower)    || engLower.startsWith(t))    s += 80;
-    if (t.startsWith(romajiLower) || romajiLower.startsWith(t)) s += 80;
-    if (prefLower && (t.startsWith(prefLower) || prefLower.startsWith(t))) s += 80;
-
-    // Substring containment
-    if (t.includes(engLower))    s += 40;
-    if (t.includes(romajiLower)) s += 40;
-    if (prefLower && t.includes(prefLower)) s += 40;
-
-    // Word overlap scoring
-    engWords.forEach(w    => { if (t.includes(w)) s += 10; });
-    romajiWords.forEach(w => { if (t.includes(w)) s += 10; });
-    prefWords.forEach(w   => { if (t.includes(w)) s += 10; });
-
-    // Length similarity bonus — rewards candidates whose length closely matches
-    // the query rather than broad titles that just happen to contain a word.
-    s += lengthSim(engLower, t);
-    s += lengthSim(romajiLower, t);
-    if (prefLower) s += lengthSim(prefLower, t);
-
-    return s;
-  }
-
-  // Make ONE search call with the cleaned english title.
-  // The API consistently returns results for "Demon Slayer" (verified working).
-  // If that returns nothing, try romaji. That's it — no more query loops.
-  // Build a progressive list of queries from most-specific to least-specific.
-  // userPreferred is AniList's preferred display title (e.g. "Witch Hat Atelier")
-  // even when english is null — this is the most important term to try first.
-  const prefFirstWord   = prefClean.split(/\s+/)[0]   || '';
-  const engFirstWord    = engClean.split(/\s+/)[0]    || '';
-  const romajiFirstWord = romajiClean.split(/\s+/)[0] || '';
-  // Strip ALL separators to get plain keyword versions
-  const prefPlain   = userPreferred.replace(/[:\-\u2013\u2014\u2212\uFF1A]/g, ' ').replace(/\s+/g, ' ').trim();
-  const engPlain    = eng.replace(/[:\-\u2013\u2014\u2212\uFF1A]/g, ' ').replace(/\s+/g, ' ').trim();
-  const romajiPlain = romaji.replace(/[:\-\u2013\u2014\u2212\uFF1A]/g, ' ').replace(/\s+/g, ' ').trim();
-
-  const searchTerms = [
-    prefClean, engClean, romajiClean,          // colon-stripped (most useful)
-    prefPlain, engPlain, romajiPlain,           // separator→space variants
-    userPreferred, eng, romaji,                 // full originals
-    prefFirstWord, engFirstWord, romajiFirstWord, // single first word (nuclear fallback)
-  ].filter((t, i, a) => t && t.length > 1 && a.indexOf(t) === i);
-
-  for (const q of searchTerms) {
-    let raw;
+  for (const q of titles) {
     try {
-      // Add _t cache buster so stale server-side in-memory cache is bypassed
-      raw = await anistreamFetch('/search?q=' + encodeURIComponent(q) + '&_t=' + Date.now());
-    } catch(e) {
-      console.warn('[S3] fetch error for "' + q + '":', e.message);
-      continue;
-    }
-
-    const results = Array.isArray(raw) ? raw : (raw.results || raw.data || []);
-    console.log('[S3] "' + q + '" → ' + results.length + ' results', results.slice(0,2).map(r=>r.title));
-
-    if (!results.length) continue;
-
-    // Pick best scoring result — highest score wins, no minimum threshold.
-    // The query progression (specific→broad) ensures we only reach vague queries
-    // if specific ones returned nothing, so even a score-0 result here is the best we have.
-    const scored = results.map(r => ({ r, s: score(r.title || '') })).sort((a,b) => b.s - a.s);
-    const best = scored[0];
-    if (!best.r || !best.r.session) continue;
-
-    console.log('[S3] Using:', best.r.session, '|', best.r.title, '(score ' + best.s + ')');
-    return best.r.session;
+      const results = await anistreamFetch('/search?q=' + encodeURIComponent(q));
+      if (!results || !results.length) continue;
+      const lower = q.toLowerCase();
+      const best = results.find(r => (r.title||'').toLowerCase() === lower)
+                || results.find(r => (r.title||'').toLowerCase().startsWith(lower.split(' ')[0]))
+                || results[0];
+      return best.session;
+    } catch(_) { continue; }
   }
-
-  throw new Error('Server 3: no match found for "' + (engClean || romajiClean) + '"');
+  throw new Error('Not found on Server 3 for "' + (anime.title.english || anime.title.romaji) + '"');
 }
 
-// Fetch episode list for an anime slug.
-// Returns: [{ number, session (=episode slug), title, snapshot }]
 async function anistreamFetchEpisodes(animeSession) {
   const eps = await anistreamFetch('/episodes?session=' + encodeURIComponent(animeSession));
-  if (!Array.isArray(eps) || !eps.length) throw new Error('No episodes returned for ' + animeSession);
+  // Always use index+1 as the episode number — the API's ep.number can be
+  // 0-based or offset (e.g. returns ep 2 for what should be ep 1).
   return eps.map((ep, i) => ({
-    number:   ep.number || (i + 1),
-    // session is the episode slug e.g. "demon-slayer-kimetsu-no-yaiba-episode-1-english-subbed"
-    session:  ep.session || ep.slug || '',
-    title:    ep.title   || `Episode ${ep.number || i + 1}`,
+    number:   i + 1,
+    session:  ep.session,
+    title:    ep.title    || `Episode ${i + 1}`,
     snapshot: ep.snapshot || null,
-  })).filter(ep => ep.session); // drop any without a valid session/slug
+  }));
 }
 
-// Build the /embed URL. anime_session = anime slug, episode_session = episode slug.
-// The /embed endpoint on our API is a full self-contained HLS player that handles
-// everything internally: /sources → /m3u8 → /proxy → HLS playback + skip intro.
-function anistreamEmbedUrl(animeSession, epSession, title, epNum) {
+function anistreamEmbedUrl(animeSession, epSession, title, malId, epNum) {
   const base = getAnistreamBase();
-  return `${base}/embed?anime_session=${encodeURIComponent(animeSession)}&episode_session=${encodeURIComponent(epSession)}&title=${encodeURIComponent(title || '')}&ep_num=${encodeURIComponent(epNum || '')}`;
+  let url = `${base}/embed?anime_session=${encodeURIComponent(animeSession)}&episode_session=${encodeURIComponent(epSession)}&title=${encodeURIComponent(title || '')}`;
+  if (malId)  url += `&mal_id=${encodeURIComponent(malId)}`;
+  if (epNum)  url += `&ep_num=${encodeURIComponent(epNum)}`;
+  return url;
 }
 
 async function loadAnistreamPlayer(anime, epNumber) {
-  const title = anime.title.english || anime.title.userPreferred || anime.title.romaji;
+  const title = anime.title.english || anime.title.romaji;
   const cacheKey = String(anime.id);
   setAnistreamStatus('loading', 'Connecting to Server 3...');
   try {
     if (!anistreamCache[cacheKey]) {
-      setAnistreamStatus('loading', 'Searching anime...');
+      setAnistreamStatus('loading', 'Searching for anime...');
       const animeSession = await anistreamFindSession(anime);
       setAnistreamStatus('loading', 'Loading episodes...');
       const epData = await anistreamFetchEpisodes(animeSession);
-      if (!epData.length) throw new Error('Episode list is empty');
       anistreamCache[cacheKey] = { animeSession, epData };
     }
-
-    const { animeSession, epData } = anistreamCache[cacheKey];
-    anistreamAnimeSession = animeSession;
-    anistreamEpData = epData;
+    const cached = anistreamCache[cacheKey];
+    anistreamAnimeSession = cached.animeSession;
+    anistreamEpData = cached.epData;
     anistreamEpSessions = {};
-    epData.forEach(ep => { anistreamEpSessions[ep.number] = ep.session; });
-
-    renderAnistreamEpSidebar(epData, epNumber);
-
-    // Find the requested episode; fall back to closest available
-    const epObj = epData.find(e => e.number === epNumber)
-               || epData.reduce((closest, e) => Math.abs(e.number - epNumber) < Math.abs(closest.number - epNumber) ? e : closest, epData[0]);
-
-    if (!epObj || !epObj.session) throw new Error(`Episode ${epNumber} not available`);
-
+    anistreamEpData.forEach(ep => { anistreamEpSessions[ep.number] = ep.session; });
+    renderAnistreamEpSidebar(anistreamEpData, epNumber);
+    const epObj = anistreamEpData.find(e => e.number === epNumber)
+               || anistreamEpData[epNumber - 1]
+               || anistreamEpData[0];
+    if (!epObj) throw new Error(`Episode ${epNumber} not found on Server 3`);
     const epLabel = `${title} — Episode ${epObj.number}`;
-    document.getElementById('playerIframe').src = anistreamEmbedUrl(animeSession, epObj.session, epLabel, epObj.number);
-    setAnistreamStatus('ok', `Server 3 · ${epData.length} eps`);
-
-    // Prefetch next episode in background
-    const nextEp = epData.find(e => e.number === epObj.number + 1);
-    if (nextEp && nextEp.session) {
-      fetch(`${getAnistreamBase()}/prefetch?anime_session=${encodeURIComponent(animeSession)}&episode_session=${encodeURIComponent(nextEp.session)}`).catch(() => {});
+    const _malId = anime._malId || anime.id || '';
+    document.getElementById('playerIframe').src = anistreamEmbedUrl(anistreamAnimeSession, epObj.session, epLabel, _malId, epObj.number);
+    setAnistreamStatus('ok', `Server 3 · ${anistreamEpData.length} eps`);
+    const nextEp = anistreamEpData.find(e => e.number === epNumber + 1);
+    if (nextEp) {
+      fetch(getAnistreamBase() + '/prefetch?anime_session=' + encodeURIComponent(anistreamAnimeSession) + '&episode_session=' + encodeURIComponent(nextEp.session),
+        { headers: { 'ngrok-skip-browser-warning': '1' } }).catch(() => {});
     }
   } catch (err) {
-    console.error('[S3] loadAnistreamPlayer error:', err);
     setAnistreamStatus('error', 'Server 3 unavailable');
     showToast('Server 3: ' + err.message, 'error');
     document.getElementById('playerIframe').src = '';
@@ -3906,9 +3809,10 @@ function selectEpAnistream(epNumber) {
   currentEp = epNumber;
   const title = currentAnime ? (currentAnime.title.english || currentAnime.title.romaji) : '';
   const epObj = anistreamEpData.find(e => e.number === epNumber);
-  if (!epObj || !epObj.session) { showToast('Episode not available on Server 3', 'error'); return; }
+  if (!epObj) { showToast('Episode not available on Server 3', 'error'); return; }
   const epLabel = `${title} — Episode ${epNumber}`;
-  document.getElementById('playerIframe').src = anistreamEmbedUrl(anistreamAnimeSession, epObj.session, epLabel, epNumber);
+  const _malId = currentAnime ? (currentAnime._malId || currentAnime.id || '') : '';
+  document.getElementById('playerIframe').src = anistreamEmbedUrl(anistreamAnimeSession, epObj.session, epLabel, _malId, epNumber);
   document.querySelectorAll('.ep-item').forEach(el => el.classList.remove('active'));
   const el = document.getElementById('ep-item-' + epNumber);
   if (el) { el.classList.add('active'); el.scrollIntoView({ block: 'nearest' }); }
@@ -3918,8 +3822,9 @@ function selectEpAnistream(epNumber) {
   updateHash(currentAnime.id, epNumber);
   incrementUserEpisodes();
   const nextEp = anistreamEpData.find(e => e.number === epNumber + 1);
-  if (nextEp && nextEp.session && anistreamAnimeSession) {
-    fetch(`${getAnistreamBase()}/prefetch?anime_session=${encodeURIComponent(anistreamAnimeSession)}&episode_session=${encodeURIComponent(nextEp.session)}`).catch(() => {});
+  if (nextEp && anistreamAnimeSession) {
+    fetch(getAnistreamBase() + '/prefetch?anime_session=' + encodeURIComponent(anistreamAnimeSession) + '&episode_session=' + encodeURIComponent(nextEp.session),
+      { headers: { 'ngrok-skip-browser-warning': '1' } }).catch(() => {});
   }
 }
 
@@ -3949,7 +3854,7 @@ function hideAnistreamStatus() {
 //   Server 1/2 compatibility when using Jikan IDs.
 // ─────────────────────────────────────────────────────────────────
 const AL = 'https://graphql.anilist.co';
-const FIELDS = `id idMal title{romaji english native userPreferred} coverImage{large extraLarge} bannerImage description(asHtml:false) episodes averageScore genres status startDate{year} format studios{nodes{name}} nextAiringEpisode{episode}`;
+const FIELDS = `id idMal title{romaji english native} coverImage{large extraLarge} bannerImage description(asHtml:false) episodes averageScore genres status startDate{year} format studios{nodes{name}} nextAiringEpisode{episode}`;
 
 const JIKAN = 'https://api.jikan.moe/v4';
 
@@ -4157,7 +4062,7 @@ async function fetchTopAiring() {
 
   if (isAnilistAvailable()) {
     try {
-      const data = await tryAnilist(`query{Page(perPage:10){media(type:ANIME,sort:POPULARITY_DESC,status:RELEASING,isAdult:false){id title{romaji english userPreferred} coverImage{large} nextAiringEpisode{episode} averageScore format episodes}}}`);
+      const data = await tryAnilist(`query{Page(perPage:10){media(type:ANIME,sort:POPULARITY_DESC,status:RELEASING,isAdult:false){id title{romaji english} coverImage{large} nextAiringEpisode{episode} averageScore format episodes}}}`);
       markAnilistUp();
       cacheSet(cacheKey, data);
       return data;
@@ -4258,7 +4163,7 @@ async function fetchRelated(id, isJikanSource) {
   if (!isJikanSource && isAnilistAvailable()) {
     try {
       const data = await tryAnilist(
-        `query($id:Int){Media(id:$id){recommendations(perPage:6){nodes{mediaRecommendation{id title{romaji english userPreferred} coverImage{large} episodes averageScore status format}}}}}`,
+        `query($id:Int){Media(id:$id){recommendations(perPage:6){nodes{mediaRecommendation{id title{romaji english} coverImage{large} episodes averageScore status format}}}}}`,
         {id}
       );
       markAnilistUp();
@@ -4737,7 +4642,7 @@ async function fetchNewEpisodes() {
 
   if (isAnilistAvailable()) {
     try {
-      const data = await tryAnilist(`query{Page(perPage:20){media(type:ANIME,status:RELEASING,sort:UPDATED_AT_DESC,isAdult:false){id title{romaji english userPreferred} coverImage{large extraLarge} episodes nextAiringEpisode{episode timeUntilAiring} averageScore format}}}`);
+      const data = await tryAnilist(`query{Page(perPage:20){media(type:ANIME,status:RELEASING,sort:UPDATED_AT_DESC,isAdult:false){id title{romaji english} coverImage{large extraLarge} episodes nextAiringEpisode{episode timeUntilAiring} averageScore format}}}`);
       markAnilistUp();
       cacheSet(cacheKey, data);
       return data;
@@ -4821,23 +4726,18 @@ function openWatch(anime, ep=1) {
   currentSeason = 1;
   totalEps = anime.episodes || 24;
 
-  // Auto-switch to Server 3 (anistream) when AniList is down (Jikan source).
+  // Auto-switch to Server 3 (vidnest) when AniList is down (Jikan source).
   // Server 1/2 require AniList IDs and will not work with Jikan/MAL IDs.
   const useAnistream = (anime._source === 'jikan');
-  currentServer = useAnistream ? 'anistream' : 'filmu';
+  currentServer = useAnistream ? 'vidnest' : 'filmu';
   currentDub = 'sub';
-  ['srv-filmu','srv-animplay','srv-anistream'].forEach(id => {
+  ['srv-filmu','srv-animplay','srv-vidnest','srv-vidnest-pahe'].forEach(id => {
     document.getElementById(id)?.classList.remove('active');
   });
-  document.getElementById(useAnistream ? 'srv-anistream' : 'srv-filmu').classList.add('active');
+  document.getElementById(useAnistream ? 'srv-vidnest' : 'srv-filmu').classList.add('active');
   document.getElementById('dub-sub').classList.add('active');
   document.getElementById('dub-dub').classList.remove('active');
-  document.getElementById('dubToggle').style.display = 'none';
-  if (!useAnistream) hideAnistreamStatus();
-
-  anistreamAnimeSession = null;
-  anistreamEpSessions = {};
-  anistreamEpData = [];
+  document.getElementById('dubToggle').style.display = getProvider(currentServer).supportsAudio ? 'flex' : 'none';
 
   showWatch();
   loadPlayer(currentSeason, ep);
@@ -4857,6 +4757,7 @@ function openWatch(anime, ep=1) {
   }
 }
 
+
 // FIX: buildEmbedUrl — when anime is from Jikan source, Server 1/2 may
 // not work since they expect AniList IDs. We still attempt it and let
 // the user know via the warning above.
@@ -4865,10 +4766,6 @@ function buildEmbedUrl(server, anilistId, season, ep, dub) {
 }
 
 function loadPlayer(season, ep) {
-  if (currentServer === 'anistream') {
-    if (currentAnime) loadAnistreamPlayer(currentAnime, ep);
-    return;
-  }
   const url = buildEmbedUrl(currentServer, currentAnime.id, season, ep, currentDub);
   document.getElementById('playerIframe').src = url;
   document.getElementById('dubToggle').style.display = getProvider(currentServer).supportsAudio ? 'flex' : 'none';
@@ -4895,22 +4792,14 @@ async function switchServer(server) {
   }
 
   currentServer = server;
-  ['srv-filmu', 'srv-animplay', 'srv-anistream'].forEach(id => {
+  ['srv-filmu', 'srv-animplay', 'srv-vidnest', 'srv-vidnest-pahe'].forEach(id => {
     document.getElementById(id)?.classList.remove('active');
   });
   document.getElementById('srv-' + server)?.classList.add('active');
 
-  if (server === 'anistream') {
-    document.getElementById('dubToggle').style.display = 'none';
-    if (currentAnime) loadAnistreamPlayer(currentAnime, currentEp);
-    if (currentAnime._source !== 'jikan') showToast('Switched to Server 3 (Best)', 'success');
-  } else {
-    hideAnistreamStatus();
-    // Rebuild standard ep sidebar if we were on anistream
-    if (anistreamEpData.length) buildEpSidebar(currentAnime);
-    loadPlayer(currentSeason, currentEp);
-    showToast(`Switched to ${getProvider(server).name}`, 'success');
-  }
+  document.getElementById('dubToggle').style.display = getProvider(server).supportsAudio ? 'flex' : 'none';
+  loadPlayer(currentSeason, currentEp);
+  showToast(`Switched to ${getProvider(server).name}`, 'success');
 }
 
 function switchDub(type) {
@@ -5082,13 +4971,6 @@ function selectEp(ep) {
 }
 
 function filterEps(q) {
-  if (currentServer === 'anistream' && anistreamEpData.length) {
-    const lq = q.toLowerCase();
-    const filtered = anistreamEpData.filter(ep =>
-      String(ep.number).includes(q) || (ep.title || '').toLowerCase().includes(lq));
-    renderAnistreamEpSlice(filtered, currentEp);
-    return;
-  }
   const lq = q.toLowerCase();
   const filtered = allEpItems.filter(ep => {
     if (String(ep).includes(q)) return true;
@@ -5648,7 +5530,7 @@ async function loadSchedule() {
 
   try {
     let allSchedules = [];
-    const query = `query($p:Int,$from:Int,$to:Int){Page(page:$p,perPage:50){pageInfo{hasNextPage}airingSchedules(airingAt_greater:$from,airingAt_lesser:$to,sort:TIME){id episode airingAt media{id title{romaji english userPreferred} coverImage{large} averageScore format episodes}}}}`;
+    const query = `query($p:Int,$from:Int,$to:Int){Page(page:$p,perPage:50){pageInfo{hasNextPage}airingSchedules(airingAt_greater:$from,airingAt_lesser:$to,sort:TIME){id episode airingAt media{id title{romaji english} coverImage{large} averageScore format episodes}}}}`;
     for (let p = 1; p <= 4; p++) {
       const data = await tryAnilist(query, { p, from: startTs, to: endTs });
       markAnilistUp();
